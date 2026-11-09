@@ -1,0 +1,70 @@
+name: linux amd64 binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: MetaCubeX/mihomo tag
+        required: true
+        default: v1.19.33
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  binary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout overlay
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: MetaCubeX/mihomo
+          ref: ${{ inputs.upstream || github.ref_name }}
+          path: src
+
+      - name: Apply UDP 0-RTT
+        run: |
+          set -eu
+          rm -rf src/third_party
+          cp -a third_party src/third_party
+          cp overlay/adapter/outbound/hysteria2.go src/adapter/outbound/hysteria2.go
+          if ! grep -q '=> ./third_party/sing-quic' src/go.mod; then
+            printf '\nreplace github.com/metacubex/sing-quic => ./third_party/sing-quic\n' >> src/go.mod
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Build
+        working-directory: src
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -eu
+          version="${{ inputs.upstream || github.ref_name }}-udp0rtt"
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${version}" \
+            -o "$GITHUB_WORKSPACE/mihomo-linux-amd64" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-linux-amd64
+          path: mihomo-linux-amd64
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${{ inputs.upstream || github.ref_name }}-udp0rtt"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "Static linux/amd64 mihomo with Hysteria2 UDP 0-RTT."
+          gh release upload "$tag" mihomo-linux-amd64 --clobber
