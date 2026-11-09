@@ -1,0 +1,35 @@
+diff -ruN /tmp/mh-a/adapter/outbound/hysteria2.go /tmp/mh-b/adapter/outbound/hysteria2.go
+--- a/adapter/outbound/hysteria2.go	2026-11-09 07:15:28.546617103 +0000
++++ b/adapter/outbound/hysteria2.go	2026-11-09 07:15:28.546617103 +0000
+@@ -62,6 +62,12 @@
+ 	BBRProfile        string     `proxy:"bbr-profile,omitempty"`
+ 	UdpMTU            int        `proxy:"udp-mtu,omitempty"`
+ 	HandshakeTimeout  int        `proxy:"handshake-timeout,omitempty"`
++	// UDP0RTT sends the first UDP datagrams without waiting for the Hysteria
++	// auth response. nil means on, including obfs salamander and gecko.
++	// On a resumed QUIC session those datagrams are real 0-RTT; otherwise they
++	// leave in the same flight as the auth POST.
++	// Set udp-0rtt: false to use the original wait-for-233 handshake.
++	UDP0RTT *bool `proxy:"udp-0rtt,omitempty"`
+ 
+ 	RealmOpts Hysteria2RealmOption `proxy:"realm-opts,omitempty"`
+ 
+@@ -232,6 +238,7 @@
+ 			common.SetCongestionController(quicConn, "bbr", option.CWND, option.BBRProfile)
+ 		},
+ 		HandshakeTimeout: time.Duration(option.HandshakeTimeout) * time.Second,
++		UDP0RTT:          udp0RTTEnabled(option.UDP0RTT),
+ 	}
+ 
+ 	var serverPorts []uint16
+@@ -319,3 +326,10 @@
+ 
+ 	return outbound, nil
+ }
++
++func udp0RTTEnabled(v *bool) bool {
++	if v == nil {
++		return true
++	}
++	return *v
++}

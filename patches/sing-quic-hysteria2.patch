@@ -1,0 +1,480 @@
+diff -ruN /tmp/sq-a/hysteria2/client.go /tmp/sq-b/hysteria2/client.go
+--- a/hysteria2/client.go	2026-11-09 07:15:01.218615920 +0000
++++ b/hysteria2/client.go	2026-11-09 01:47:50.411231278 +0000
+@@ -47,10 +47,14 @@
+ 	TLSConfig          *tls.Config
+ 	QUICConfig         *quic.Config
+ 	UDPDisabled        bool
+-	RealmOptions       *realm.Options
+-	SetBBRCongestion   SetCongestionControllerFunc
+-	UdpMTU             int
+-	HandshakeTimeout   time.Duration
++	// UDP0RTT lets UDP datagrams be sent as soon as the QUIC connection can
++	// carry application data (0-RTT on resumption, otherwise overlapped with
++	// the Hysteria auth request) instead of waiting for the auth response.
++	UDP0RTT          bool
++	RealmOptions     *realm.Options
++	SetBBRCongestion SetCongestionControllerFunc
++	UdpMTU           int
++	HandshakeTimeout time.Duration
+ }
+ 
+ type Client struct {
+@@ -73,6 +77,7 @@
+ 	tlsConfig          *tls.Config
+ 	quicConfig         *quic.Config
+ 	udpDisabled        bool
++	udp0RTT            bool
+ 	realmOptions       *realm.Options
+ 	controlClient      *realm.ControlClient
+ 	setBBRCongestion   SetCongestionControllerFunc
+@@ -112,6 +117,11 @@
+ 	if len(options.TLSConfig.NextProtos) == 0 {
+ 		options.TLSConfig.NextProtos = []string{http3.NextProtoH3}
+ 	}
++	// A cached ticket is what lets the next dial send real 0-RTT, including
++	// through Salamander or Gecko. The obfuscator only wraps the UDP payload.
++	if options.UDP0RTT && options.TLSConfig.ClientSessionCache == nil {
++		options.TLSConfig.ClientSessionCache = tls.NewLRUClientSessionCache(8)
++	}
+ 	if options.RealmOptions != nil {
+ 		if len(options.ServerPorts) > 0 {
+ 			return nil, E.New("realm and port hopping are mutually exclusive")
+@@ -159,6 +169,7 @@
+ 		tlsConfig:          options.TLSConfig,
+ 		quicConfig:         quicConfig,
+ 		udpDisabled:        options.UDPDisabled,
++		udp0RTT:            options.UDP0RTT,
+ 		realmOptions:       options.RealmOptions,
+ 		controlClient:      controlClient,
+ 		setBBRCongestion:   options.SetBBRCongestion,
+@@ -203,6 +214,22 @@
+ }
+ 
+ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
++	if c.udp0RTT {
++		return c.offerShared(ctx, true)
++	}
++	return c.offerLegacy(ctx)
++}
++
++// offerUDP is ListenPacket's entry. With UDP 0-RTT it returns as soon as the
++// QUIC connection can send datagrams, while auth is still in flight.
++func (c *Client) offerUDP(ctx context.Context) (*clientQUICConnection, error) {
++	if c.udp0RTT {
++		return c.offerShared(ctx, false)
++	}
++	return c.offerLegacy(ctx)
++}
++
++func (c *Client) offerLegacy(ctx context.Context) (*clientQUICConnection, error) {
+ 	c.connAccess.Lock()
+ 	conn := c.conn
+ 	if conn != nil && conn.active() {
+@@ -214,7 +241,7 @@
+ 	// just follow the incoming context
+ 	if c.handshakeTimeout <= 0 {
+ 		defer c.connAccess.Unlock()
+-		conn, err := c.offerNew(ctx)
++		conn, err := c.offerNew(ctx, nil)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -244,6 +271,7 @@
+ 	offerCtx, cancel := common.ContextWithCancelCause(offerCtx)
+ 	pending = &clientOffer{
+ 		done:   make(chan struct{}),
++		dialed: make(chan struct{}),
+ 		cancel: cancel,
+ 	}
+ 	c.pending = pending
+@@ -259,11 +287,103 @@
+ 	}
+ }
+ 
++func (c *Client) offerShared(ctx context.Context, waitAuth bool) (*clientQUICConnection, error) {
++	c.connAccess.Lock()
++	if conn := c.conn; conn != nil && !conn.active() {
++		c.conn = nil
++	}
++	if conn := c.conn; conn != nil && conn.active() {
++		c.connAccess.Unlock()
++		if !waitAuth {
++			return conn, nil
++		}
++		if err := conn.waitAuth(ctx); err != nil {
++			return nil, err
++		}
++		if !conn.active() {
++			return nil, E.New("connection closed")
++		}
++		return conn, nil
++	}
++	pending := c.pending
++	if pending == nil {
++		offerCtx := c.ctx
++		if offerCtx == nil {
++			offerCtx = context.Background()
++		}
++		offerCtx, cancel := common.ContextWithCancelCause(offerCtx)
++		pending = &clientOffer{
++			done:   make(chan struct{}),
++			dialed: make(chan struct{}),
++			cancel: cancel,
++		}
++		c.pending = pending
++		go c.completeOffer(pending, offerCtx)
++	}
++	c.connAccess.Unlock()
++
++	if waitAuth {
++		select {
++		case <-pending.done:
++			if pending.err != nil {
++				return nil, pending.err
++			}
++			return pending.conn, nil
++		case <-ctx.Done():
++			return nil, context.Cause(ctx)
++		}
++	}
++	select {
++	case <-pending.dialed:
++	case <-ctx.Done():
++		return nil, context.Cause(ctx)
++	}
++	c.connAccess.Lock()
++	conn := pending.conn
++	err := pending.err
++	c.connAccess.Unlock()
++	if conn != nil && conn.active() {
++		return conn, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	select {
++	case <-pending.done:
++	case <-ctx.Done():
++		return nil, context.Cause(ctx)
++	}
++	c.connAccess.Lock()
++	conn = pending.conn
++	err = pending.err
++	c.connAccess.Unlock()
++	if conn != nil && conn.active() {
++		return conn, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	return nil, E.New("hysteria2 dial failed")
++}
++
+ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
+-	offerCtx, cancel := context.WithTimeout(offerCtx, c.handshakeTimeout) // c.handshakeTimeout must gather zero at here
+-	defer cancel()
+-	conn, err := c.offerNew(offerCtx)
++	ctx := offerCtx
++	if c.handshakeTimeout > 0 {
++		var cancel context.CancelFunc
++		ctx, cancel = context.WithTimeout(offerCtx, c.handshakeTimeout)
++		defer cancel()
++	}
++	conn, err := c.offerNew(ctx, func(dialed *clientQUICConnection) {
++		c.connAccess.Lock()
++		pending.conn = dialed
++		if !pending.discarded {
++			c.conn = dialed
++		}
++		c.connAccess.Unlock()
++		pending.dialOnce.Do(func() { close(pending.dialed) })
++	})
+ 	pending.cancel(nil)
++	pending.dialOnce.Do(func() { close(pending.dialed) })
+ 
+ 	discardErr := err
+ 	shouldDiscard := false
+@@ -275,10 +395,12 @@
+ 		}
+ 		pending.err = discardErr
+ 	} else {
+-		pending.conn = conn
+ 		pending.err = err
+ 		if err == nil {
++			pending.conn = conn
+ 			c.conn = conn
++		} else if c.conn != nil && !c.conn.active() {
++			c.conn = nil
+ 		}
+ 	}
+ 	if c.pending == pending {
+@@ -292,15 +414,15 @@
+ 	}
+ }
+ 
+-func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
++func (c *Client) offerNew(ctx context.Context, onDialed func(*clientQUICConnection)) (*clientQUICConnection, error) {
+ 	if c.realmOptions != nil {
+-		return c.offerNewRealm(ctx)
++		return c.offerNewRealm(ctx, onDialed)
+ 	}
+ 	serverAddr := c.serverAddress
+ 	if len(c.serverPorts) > 0 { // randomize select a port from serverPorts
+ 		serverAddr.Port = c.serverPorts[randv2.IntN(len(c.serverPorts))]
+ 	}
+-	return c.authenticateAndWrap(ctx, c.packetDialer, serverAddr)
++	return c.authenticateAndWrap(ctx, c.packetDialer, serverAddr, onDialed)
+ }
+ 
+ type realmFamilyConn struct {
+@@ -310,7 +432,7 @@
+ 	localAddresses []netip.AddrPort
+ }
+ 
+-func (c *Client) offerNewRealm(ctx context.Context) (*clientQUICConnection, error) {
++func (c *Client) offerNewRealm(ctx context.Context, onDialed func(*clientQUICConnection)) (*clientQUICConnection, error) {
+ 	families, err := c.realmOpenFamilies(ctx)
+ 	if err != nil {
+ 		return nil, err
+@@ -343,7 +465,7 @@
+ 	packetDialer := qtls.PacketDialerFunc(func(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+ 		return packetConn, nil
+ 	})
+-	return c.authenticateAndWrap(ctx, packetDialer, peerAddr)
++	return c.authenticateAndWrap(ctx, packetDialer, peerAddr, onDialed)
+ }
+ 
+ func (c *Client) realmOpenFamilies(ctx context.Context) ([]*realmFamilyConn, error) {
+@@ -497,7 +619,14 @@
+ 	return nil, realm.PunchResult{}, E.Cause(E.Errors(errs...), "realm punch")
+ }
+ 
+-func (c *Client) authenticateAndWrap(ctx context.Context, packetDialer qtls.PacketDialer, serverAddr M.Socksaddr) (*clientQUICConnection, error) {
++func (c *Client) authenticateAndWrap(ctx context.Context, packetDialer qtls.PacketDialer, serverAddr M.Socksaddr, onDialed func(*clientQUICConnection)) (*clientQUICConnection, error) {
++	if !c.udp0RTT {
++		return c.authenticateLegacy(ctx, packetDialer, serverAddr)
++	}
++	return c.authenticateEarly(ctx, packetDialer, serverAddr, onDialed)
++}
++
++func (c *Client) authenticateLegacy(ctx context.Context, packetDialer qtls.PacketDialer, serverAddr M.Socksaddr) (*clientQUICConnection, error) {
+ 	_packetDialer := packetDialer // make a copy
+ 	packetDialer = qtls.PacketDialerFunc(func(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+ 		pc, err := _packetDialer.ListenPacket(ctx, network, address, rAddrPort)
+@@ -578,6 +707,114 @@
+ 	return conn, nil
+ }
+ 
++func (c *Client) authenticateEarly(ctx context.Context, packetDialer qtls.PacketDialer, serverAddr M.Socksaddr, onDialed func(*clientQUICConnection)) (*clientQUICConnection, error) {
++	_packetDialer := packetDialer // make a copy
++	packetDialer = qtls.PacketDialerFunc(func(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
++		pc, err := _packetDialer.ListenPacket(ctx, network, address, rAddrPort)
++		if err != nil {
++			return nil, err
++		}
++		if c.geckoPassword != "" {
++			pc = NewGeckoConn(pc, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize)
++		} else if c.salamanderPassword != "" {
++			pc = NewSalamanderConn(pc, []byte(c.salamanderPassword))
++		}
++		return pc, nil
++	})
++
++	packetConn, quicConn, err := c.quicDialer.DialContext(ctx, serverAddr.String(), packetDialer, c.tlsConfig, c.quicConfig, true)
++	if err != nil {
++		return nil, err
++	}
++
++	conn := &clientQUICConnection{
++		quicConn:   quicConn,
++		rawConn:    packetConn,
++		connDone:   make(chan struct{}),
++		udpConnMap: make(map[uint32]*udpPacketConn),
++		authDone:   make(chan struct{}),
++	}
++	go func() {
++		<-quicConn.Context().Done()
++		conn.closeWithError(context.Cause(quicConn.Context()))
++	}()
++	var authErr error
++	defer func() { conn.finishAuth(authErr) }()
++	// Publish before Hysteria auth so UDP writes can share the 0-RTT / handshake
++	// flight instead of waiting for the status-233 response.
++	// Do not start HTTP/3 yet. Its control stream is opened with 0-RTT keys
++	// when they exist, and quic-go closes the connection if the server rejects
++	// that stream. Auth stays 1-RTT; only datagrams go out early.
++	if c.udp0RTT && !c.udpDisabled {
++		go c.loopMessages(conn)
++		if onDialed != nil {
++			onDialed(conn)
++		}
++	}
++	select {
++	case <-quicConn.HandshakeComplete():
++	case <-ctx.Done():
++		authErr = context.Cause(ctx)
++		conn.closeWithError(authErr)
++		return nil, authErr
++	case <-quicConn.Context().Done():
++		authErr = context.Cause(quicConn.Context())
++		conn.closeWithError(authErr)
++		return nil, authErr
++	}
++
++	http3Transport := &http3.Transport{
++		TLSClientConfig: c.tlsConfig,
++		QUICConfig:      c.quicConfig,
++		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
++			return quicConn, nil
++		},
++	}
++	request := &http.Request{
++		Method: http.MethodPost,
++		URL: &url.URL{
++			Scheme: "https",
++			Host:   protocol.URLHost,
++			Path:   protocol.URLPath,
++		},
++		Header: make(http.Header),
++	}
++	protocol.AuthRequestToHeader(request.Header, protocol.AuthRequest{Auth: c.password, Rx: c.receiveBPS})
++	response, err := http3Transport.RoundTrip(request.WithContext(ctx))
++	if err != nil {
++		authErr = err
++		conn.closeWithError(err)
++		return nil, err
++	}
++	response.Body.Close()
++	if response.StatusCode != protocol.StatusAuthOK {
++		authErr = E.New("authentication failed, status code: ", response.StatusCode)
++		conn.closeWithError(authErr)
++		return nil, authErr
++	}
++	authResponse := protocol.AuthResponseFromHeader(response.Header)
++	actualTx := authResponse.Rx
++	if actualTx == 0 || actualTx > c.sendBPS {
++		actualTx = c.sendBPS
++	}
++	if !authResponse.RxAuto && actualTx > 0 {
++		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, c.brutalDebug, c.logger))
++	} else {
++		if c.setBBRCongestion != nil {
++			c.setBBRCongestion(quicConn)
++		}
++	}
++	if !authResponse.UDPEnabled {
++		conn.disableUDP(E.New("UDP disabled by server"))
++	} else if !c.udp0RTT && !c.udpDisabled {
++		go c.loopMessages(conn)
++	}
++	if c.hopInterval > 0 {
++		go c.hopLoop(conn)
++	}
++	return conn, nil
++}
++
+ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
+ 	conn, err := c.offer(ctx)
+ 	if err != nil {
+@@ -597,13 +834,10 @@
+ 	if c.udpDisabled {
+ 		return nil, os.ErrInvalid
+ 	}
+-	conn, err := c.offer(ctx)
++	conn, err := c.offerUDP(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if conn.udpDisabled {
+-		return nil, E.New("UDP disabled by server")
+-	}
+ 	var sessionID uint32
+ 	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, func() {
+ 		conn.udpAccess.Lock()
+@@ -617,6 +851,11 @@
+ 		return nil, E.Errors(conn.connErr, os.ErrClosed)
+ 	default:
+ 	}
++	if conn.udpDisabled {
++		conn.udpAccess.Unlock()
++		clientPacketConn.closeWithError(E.New("UDP disabled by server"))
++		return nil, E.New("UDP disabled by server")
++	}
+ 	sessionID = conn.udpSessionID
+ 	conn.udpSessionID++
+ 	conn.udpConnMap[sessionID] = clientPacketConn
+@@ -647,6 +886,8 @@
+ 
+ type clientOffer struct {
+ 	done      chan struct{}
++	dialed    chan struct{}
++	dialOnce  sync.Once
+ 	cancel    func(error)
+ 	conn      *clientQUICConnection
+ 	err       error
+@@ -664,6 +905,42 @@
+ 	udpAccess    sync.RWMutex
+ 	udpConnMap   map[uint32]*udpPacketConn
+ 	udpSessionID uint32
++	authOnce     sync.Once
++	authDone     chan struct{}
++	authErr      error
++}
++
++func (c *clientQUICConnection) finishAuth(err error) {
++	if c.authDone == nil {
++		return
++	}
++	c.authOnce.Do(func() {
++		c.authErr = err
++		close(c.authDone)
++	})
++}
++
++func (c *clientQUICConnection) waitAuth(ctx context.Context) error {
++	if c.authDone == nil {
++		return nil
++	}
++	select {
++	case <-c.authDone:
++		return c.authErr
++	case <-ctx.Done():
++		return context.Cause(ctx)
++	}
++}
++
++func (c *clientQUICConnection) disableUDP(err error) {
++	c.udpAccess.Lock()
++	c.udpDisabled = true
++	udpConnMap := c.udpConnMap
++	c.udpConnMap = make(map[uint32]*udpPacketConn)
++	c.udpAccess.Unlock()
++	for _, udpConn := range udpConnMap {
++		udpConn.closeWithError(err)
++	}
+ }
+ 
+ func (c *clientQUICConnection) active() bool {
+@@ -682,6 +959,7 @@
+ 
+ func (c *clientQUICConnection) closeWithError(err error) {
+ 	c.closeOnce.Do(func() {
++		c.finishAuth(err)
+ 		c.connErr = err
+ 		c.udpAccess.Lock()
+ 		close(c.connDone)
+diff -ruN /tmp/sq-a/hysteria2/service.go /tmp/sq-b/hysteria2/service.go
+--- a/hysteria2/service.go	2026-11-09 07:15:01.218615920 +0000
++++ b/hysteria2/service.go	2026-11-08 09:25:57.378780074 +0000
+@@ -85,6 +85,10 @@
+ 	quicConfig.DisablePathManager = true // for port hopping
+ 	quicConfig.DisablePathMTUDiscovery = !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin")
+ 	quicConfig.EnableDatagrams = !options.UDPDisabled
++	// Accept QUIC 0-RTT so a resumed client can put UDP datagrams in the first
++	// flight. Auth stays on the HTTP/3 POST, which http3 does not send as 0-RTT.
++	// Replayed 0-RTT datagrams are ordinary UDP duplicates.
++	quicConfig.Allow0RTT = true
+ 	if quicConfig.MaxIncomingStreams == 0 {
+ 		quicConfig.MaxIncomingStreams = 1 << 60
+ 	}

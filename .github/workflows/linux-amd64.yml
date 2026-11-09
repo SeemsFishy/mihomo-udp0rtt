@@ -29,14 +29,7 @@ jobs:
           path: src
 
       - name: Apply UDP 0-RTT
-        run: |
-          set -eu
-          rm -rf src/third_party
-          cp -a third_party src/third_party
-          cp overlay/adapter/outbound/hysteria2.go src/adapter/outbound/hysteria2.go
-          if ! grep -q '=> ./third_party/sing-quic' src/go.mod; then
-            printf '\nreplace github.com/metacubex/sing-quic => ./third_party/sing-quic\n' >> src/go.mod
-          fi
+        run: sh scripts/apply.sh
 
       - uses: actions/setup-go@v5
         with:
