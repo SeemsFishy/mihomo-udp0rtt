@@ -22,22 +22,31 @@ RUN set -eu; \
       -ldflags "-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=${BUILD_TIME}" \
       -o /out/mihomo .
 
+# Fetch geo data on the build machine. The final stage runs under qemu when
+# the image is arm64, and wget from there fails with exit 4.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS geo
+
+RUN apk add --no-cache ca-certificates curl \
+ && mkdir -p /geo \
+ && curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+      -o /geo/geoip.metadb https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb \
+ && curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+      -o /geo/geosite.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat \
+ && curl -fL --retry 8 --retry-all-errors --retry-delay 2 \
+      -o /geo/geoip.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat
+
 FROM alpine:3.22
 
-LABEL org.opencontainers.image.source="https://github.com/SeemsFishy/mihomo-udp0rtt"
+LABEL org.opencontainers.image.source="https://github.com/SeemsFishy/mihomo"
 LABEL org.opencontainers.image.description="mihomo with Hysteria2 UDP 0-RTT"
 ARG VERSION=v1.19.33-udp0rtt
 LABEL org.opencontainers.image.version="${VERSION}"
 
-RUN apk add --no-cache ca-certificates tzdata iptables wget \
- && mkdir -p /root/.config/mihomo \
- && wget -q -O /root/.config/mihomo/geoip.metadb https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb \
- && wget -q -O /root/.config/mihomo/geosite.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat \
- && wget -q -O /root/.config/mihomo/geoip.dat https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat \
- && apk del wget
+RUN apk add --no-cache ca-certificates tzdata iptables
 
 VOLUME ["/root/.config/mihomo/"]
 
+COPY --from=geo /geo/ /root/.config/mihomo/
 COPY --from=build /out/mihomo /mihomo
 
 ENTRYPOINT ["/mihomo"]
