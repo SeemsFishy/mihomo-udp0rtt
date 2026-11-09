@@ -32,6 +32,16 @@ jobs:
       - name: Apply UDP 0-RTT
         run: sh scripts/apply.sh
 
+      - name: Download geo databases
+        run: |
+          set -eu
+          mkdir -p src/docker/geo
+          base=https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest
+          for name in geoip.metadb geosite.dat geoip.dat; do
+            curl -fL --retry 10 --retry-all-errors --retry-delay 3 \
+              -o "src/docker/geo/$name" "$base/$name"
+          done
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 

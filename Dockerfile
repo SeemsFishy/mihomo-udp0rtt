@@ -1,26 +1,4 @@
 # syntax=docker/dockerfile:1
-# Geo files are fetched on the build machine. The final stage is often arm64
-# under QEMU, and wget there fails with "network failure" (exit 4).
-FROM --platform=$BUILDPLATFORM alpine:3.22 AS geo
-
-RUN apk add --no-cache ca-certificates wget \
- && mkdir -p /geo \
- && download() { \
-      name="$1"; \
-      i=0; \
-      until wget -O "/geo/$name" "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/$name"; do \
-        i=$((i+1)); \
-        if [ "$i" -ge 5 ]; then \
-          echo "failed to download $name" >&2; \
-          exit 1; \
-        fi; \
-        sleep $((i * 5)); \
-      done; \
-    }; \
-    download geoip.metadb; \
-    download geosite.dat; \
-    download geoip.dat
-
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 
 RUN apk add --no-cache git ca-certificates
@@ -46,7 +24,7 @@ RUN set -eu; \
 
 FROM alpine:3.22
 
-LABEL org.opencontainers.image.source="https://github.com/SeemsFishy/mihomo"
+LABEL org.opencontainers.image.source="https://github.com/SeemsFishy/mihomo-udp0rtt"
 LABEL org.opencontainers.image.description="mihomo with Hysteria2 UDP 0-RTT"
 ARG VERSION=v1.19.33-udp0rtt
 LABEL org.opencontainers.image.version="${VERSION}"
@@ -54,7 +32,9 @@ LABEL org.opencontainers.image.version="${VERSION}"
 RUN apk add --no-cache ca-certificates tzdata iptables \
  && mkdir -p /root/.config/mihomo
 
-COPY --from=geo /geo/ /root/.config/mihomo/
+# Filled by the workflow on the runner. Downloading these inside BuildKit
+# fails: GitHub release assets stall, and arm64 QEMU makes it worse.
+COPY docker/geo/ /root/.config/mihomo/
 VOLUME ["/root/.config/mihomo/"]
 COPY --from=build /out/mihomo /mihomo
 
